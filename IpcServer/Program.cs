@@ -8,21 +8,24 @@ namespace IpcServer
         {
             string[] cmds = new string[]
             {
-                "qwer",
-                "asdf",
-                "zxcv",
-                "uiop",
-                "hjkl"
+                "create",
+                "delete",
+                "drop",
+                "none",
+                "calculate",
             };
             var Rnd = new Random();
-            var IpcServer = new Ipc("testmmf", 128, 4);
+            var IpcServer = new Ipc("testmmf", 8, 4);
             IpcServer.Open();
             while (true) 
             {
                 var cmd = cmds[Rnd.Next(0, 5)];
-                IpcServer.Send(cmd);
-                Console.WriteLine($"{cmd} sent");
-                Thread.Sleep(1000);
+                int msgsCnt = Rnd.Next(0, 4);
+                var data = new byte[msgsCnt];
+                Rnd.NextBytes(data);
+                IpcServer.Send(cmd, data);
+                Console.WriteLine($"{cmd} {String.Join(" ", data)} sent");
+                Thread.Sleep(5000);
             }
         }
     }

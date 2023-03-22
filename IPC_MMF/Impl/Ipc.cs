@@ -10,11 +10,12 @@ namespace IPC_MMF.Impl
         private EventWaitHandle? NamedMMFWaiter;
         private MemoryMappedFile? MMF;
 
-        private IpcMode WorkMode;
+        private CancellationTokenSource cts = new CancellationTokenSource();
+        private readonly IpcMode WorkMode;
+        private readonly int maxMessageLength;
+        private readonly int maxMessageNumber;
+        private readonly string name;
         private bool disposed = false;
-        private int maxMessageLength;
-        private int maxMessageNumber;
-        private string name;
 
         public event EventHandler<IpcEventArgs>? Received;
 
@@ -32,9 +33,10 @@ namespace IPC_MMF.Impl
 
         public void Close()
         {
-            ReceiverWorker?.Dispose();
+            cts.Cancel();
             NamedMMFWaiter?.Dispose();
             MMF?.Dispose();
+            ReceiverWorker?.Dispose();
         }
 
         public void Dispose()
@@ -48,20 +50,25 @@ namespace IPC_MMF.Impl
 
         public void Open()
         {
+            Close();
+            cts = new CancellationTokenSource();
+
             if (WorkMode == IpcMode.Listener)
+            {
                 OpenListen();
+            }
             else if (WorkMode == IpcMode.Owner)
                 OpenWrite();
         }
 
         private void OpenListen()
         {
-            while (!disposed)
+            while (!cts.Token.IsCancellationRequested)
             {
                 try
                 {
                     if (!EventWaitHandle.TryOpenExisting($"waiter_{name}", out NamedMMFWaiter))
-                        throw new Exception("No system mutex found");
+                        throw new Exception("No system WaitHandle found");
                     MMF = MemoryMappedFile.OpenExisting(name, MemoryMappedFileRights.Read);
                     break;
                 }
@@ -73,14 +80,15 @@ namespace IPC_MMF.Impl
                 {
                     Console.WriteLine(ex.Message);
                 }
+                Thread.Sleep(1500);
             }
             Console.WriteLine($"Connected to MMF {name}");
-            ReceiverWorker = Task.Factory.StartNew(() => WaitSignal());
+            ReceiverWorker = Task.Factory.StartNew(() => WaitSignal(), cts.Token);
         }
 
         private void WaitSignal()
         {
-            while (!disposed)
+            while (true)
             {
                 if (NamedMMFWaiter is null || Received is null)
                     return;
@@ -97,12 +105,21 @@ namespace IPC_MMF.Impl
             {
                 if (MMF is null)
                     return null;
-                using (var MMFStream = MMF.CreateViewStream(0, 128 + maxMessageLength * maxMessageNumber, MemoryMappedFileAccess.Read))
+                int MessageSize = 0, CommandSize = 0;
+                string Command = string.Empty;
+                using (var MMFStream = MMF.CreateViewStream(0, 5 + 128, MemoryMappedFileAccess.Read))
                 {
-                    Span<byte> Message = stackalloc byte[128 + maxMessageLength * maxMessageNumber];
+                    Span<byte> Message = stackalloc byte[5 + 128];
                     MMFStream.Read(Message);
-                    string Command = Encoding.UTF8.GetString(Message.Slice(0, 128));
-                    var Data = Message.Slice(128).ToArray();
+                    CommandSize = Message[0];
+                    MessageSize = BitConverter.ToInt32(Message.Slice(1, 8));
+                    Command = Encoding.UTF8.GetString(Message.Slice(5, CommandSize));
+                }
+                using (var MMFDataStream = MMF.CreateViewStream(5 + CommandSize, MessageSize, MemoryMappedFileAccess.Read))
+                {
+                    Span<byte> Message = stackalloc byte[MessageSize];
+                    MMFDataStream.Read(Message);
+                    var Data = MessageSize > 0 ? Message.Slice(0, MessageSize).ToArray() : null;
                     return new IpcEventArgs(Command, Data);
                 }
             }
@@ -119,7 +136,7 @@ namespace IPC_MMF.Impl
                 if (!EventWaitHandle.TryOpenExisting($"waiter_{name}", out NamedMMFWaiter))
                     NamedMMFWaiter = new EventWaitHandle(false, EventResetMode.AutoReset, $"waiter_{name}");
                 var PersFile = File.Create("data.bin");
-                MMF = MemoryMappedFile.CreateFromFile(PersFile, name, 128 + maxMessageLength * maxMessageNumber, MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, false);
+                MMF = MemoryMappedFile.CreateFromFile(PersFile, name, 5 + 128 + maxMessageLength * maxMessageNumber, MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, false);
                 Console.WriteLine("Write session started");
             }
             catch 
@@ -130,22 +147,36 @@ namespace IPC_MMF.Impl
 
         public void Send(string command)
         {
-            if (WorkMode == IpcMode.Listener || MMF is null || NamedMMFWaiter is null)
-                return;
-            using (var MMFStream = MMF.CreateViewStream(0, 128))
-            {
-                var Cmd = Encoding.UTF8.GetBytes(command);
-                if (Cmd.Length > 128)
-                    throw new Exception("Command is too big");
-                MMFStream.Seek(0, SeekOrigin.Begin);
-                MMFStream.Write(Cmd);
-            }
-            NamedMMFWaiter.Set();
+            if (WorkMode == IpcMode.Owner)
+                SendFromServer(command, null);
         }
 
         public void Send(string command, byte[]? data)
         {
-            throw new NotImplementedException();
+            if (WorkMode == IpcMode.Owner)
+                SendFromServer(command, data);
+        }
+
+        private void SendFromServer(string command, byte[]? data)
+        {
+            if (MMF is null || NamedMMFWaiter is null)
+                return;
+            using (var MMFStream = MMF.CreateViewStream(0, 5 + 128 + maxMessageLength * maxMessageNumber))
+            {
+                Span<byte> CommandBytes = stackalloc byte[128];
+                var CommandLength = Encoding.UTF8.GetBytes(command, CommandBytes);
+                if (CommandLength > 128)
+                    throw new Exception("Command is too big");
+                MMFStream.Seek(0, SeekOrigin.Begin);
+                MMFStream.WriteByte((byte)CommandLength);
+                var DataSize = data is null ? new byte[] { 0 } : BitConverter.GetBytes(data.Length);
+                MMFStream.Write(DataSize, 0, DataSize.Length);
+                MMFStream.Seek(5, SeekOrigin.Begin);
+                MMFStream.Write(CommandBytes.Slice(0, CommandLength));
+                if (data is not null)
+                    MMFStream.Write(data, 0, data.Length);
+            }
+            NamedMMFWaiter.Set();
         }
 
         private void OnReceived(IpcEventArgs arg)

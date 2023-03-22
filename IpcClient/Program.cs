@@ -14,7 +14,7 @@ namespace IpcClient
 
         static void Received(object? sender, Ipc.IpcEventArgs e)
         {
-            Console.WriteLine($"Command {e.Command}");
+            Console.WriteLine($"{e.Command}: {(e.Data is not null ? String.Join(" ", e.Data) : "null")}");
         }
     }
 }
